@@ -73,10 +73,19 @@ class AudioProcessor:
         from scipy.signal import butter, sosfilt
         
         options = options or {}
-        sensitivity = float(options.get("sensitivity", 50.0))
+        # Hardcode values since UI sliders are removed for cleaner interface
+        sensitivity = 50.0
+        complexity = 60.0
+        
         # sensitivity 0 -> higher thresholds (fewer notes), 100 -> lower thresholds (more notes)
-        # map 0-100 to a scale factor for wait/pre/post/delta
         sens_factor = 1.0 - ((sensitivity - 50.0) / 100.0) # 50 = 1.0, 100 = 0.5, 0 = 1.5
+        
+        # Calculate RMS energy for noise gate
+        rms = librosa.feature.rms(y=y, frame_length=2048, hop_length=512)[0]
+        rms_threshold = 0.02 # Threshold for absolute silence
+        
+        def filter_peaks(peaks):
+            return np.array([p for p in peaks if p < len(rms) and rms[p] > rms_threshold])
         
         onsets_dict = {}
         
@@ -86,47 +95,60 @@ class AudioProcessor:
             sos_kick = butter(4, 150, 'low', fs=self.sr, output='sos')
             y_kick = sosfilt(sos_kick, y)
             env_kick = librosa.onset.onset_strength(y=y_kick, sr=self.sr)
-            peaks_kick = librosa.onset.onset_detect(onset_envelope=env_kick, sr=self.sr, wait=int(8*sens_factor), pre_max=int(4*sens_factor), post_max=int(4*sens_factor), pre_avg=int(8*sens_factor), post_avg=int(8*sens_factor), delta=0.06*sens_factor)
+            peaks_kick = librosa.onset.onset_detect(onset_envelope=env_kick, sr=self.sr, wait=int(12*sens_factor), pre_max=int(4*sens_factor), post_max=int(4*sens_factor), pre_avg=int(8*sens_factor), post_avg=int(8*sens_factor), delta=0.20*sens_factor)
+            peaks_kick = filter_peaks(peaks_kick)
             onsets_dict["kick"] = [{"time": float(t), "pitch": 0.0} for t in librosa.frames_to_time(peaks_kick, sr=self.sr)]
             
             # 2. SNARE (200 - 1000 Hz)
             sos_snare = butter(4, [200, 1000], 'bandpass', fs=self.sr, output='sos')
             y_snare = sosfilt(sos_snare, y)
             env_snare = librosa.onset.onset_strength(y=y_snare, sr=self.sr)
-            peaks_snare = librosa.onset.onset_detect(onset_envelope=env_snare, sr=self.sr, wait=int(10*sens_factor), pre_max=int(4*sens_factor), post_max=int(4*sens_factor), pre_avg=int(10*sens_factor), post_avg=int(10*sens_factor), delta=0.07*sens_factor)
+            peaks_snare = librosa.onset.onset_detect(onset_envelope=env_snare, sr=self.sr, wait=int(12*sens_factor), pre_max=int(4*sens_factor), post_max=int(4*sens_factor), pre_avg=int(10*sens_factor), post_avg=int(10*sens_factor), delta=0.20*sens_factor)
+            peaks_snare = filter_peaks(peaks_snare)
             onsets_dict["snare"] = [{"time": float(t), "pitch": 0.0} for t in librosa.frames_to_time(peaks_snare, sr=self.sr)]
             
             # 3. HI-HAT / CYMBALS (> 5000 Hz)
             sos_hh = butter(4, 5000, 'high', fs=self.sr, output='sos')
             y_hh = sosfilt(sos_hh, y)
             env_hh = librosa.onset.onset_strength(y=y_hh, sr=self.sr)
-            peaks_hh = librosa.onset.onset_detect(onset_envelope=env_hh, sr=self.sr, wait=int(4*sens_factor), pre_max=int(2*sens_factor), post_max=int(2*sens_factor), pre_avg=int(6*sens_factor), post_avg=int(6*sens_factor), delta=0.08*sens_factor)
+            peaks_hh = librosa.onset.onset_detect(onset_envelope=env_hh, sr=self.sr, wait=int(8*sens_factor), pre_max=int(2*sens_factor), post_max=int(2*sens_factor), pre_avg=int(6*sens_factor), post_avg=int(6*sens_factor), delta=0.15*sens_factor)
+            peaks_hh = filter_peaks(peaks_hh)
             onsets_dict["hihat"] = [{"time": float(t), "pitch": 0.0} for t in librosa.frames_to_time(peaks_hh, sr=self.sr)]
             
-        elif instrument == "bass":
-            y_harmonic, y_percussive = librosa.effects.hpss(y, margin=(1.0, 5.0))
-            onset_env = librosa.onset.onset_strength(y=y_percussive, sr=self.sr)
-            peaks = librosa.onset.onset_detect(onset_envelope=onset_env, sr=self.sr, wait=int(12*sens_factor), pre_max=int(6*sens_factor), post_max=int(6*sens_factor), pre_avg=int(12*sens_factor), post_avg=int(12*sens_factor), delta=0.04*sens_factor)
+        elif instrument in ["bass", "guitar", "vocals"]:
+            # SuperFlux algorithm for precise onset detection
+            # 1. Compute Mel Spectrogram
+            S = librosa.feature.melspectrogram(y=y, sr=self.sr, n_mels=128, fmax=8000)
+            S_db = librosa.power_to_db(S, ref=np.max)
             
-            pitches, magnitudes = librosa.piptrack(y=y_harmonic, sr=self.sr)
+            # 2. Compute onset strength with SuperFlux parameters (max_size=3 avoids double-hits)
+            onset_env = librosa.onset.onset_strength(S=S_db, sr=self.sr, max_size=3)
+            
+            # 3. Detect peaks
+            # Delta ajustado para detectar todos los rasgueos de guitarra/bajo sin perder notas (0.08)
+            peaks = librosa.onset.onset_detect(onset_envelope=onset_env, sr=self.sr, backtrack=False,
+                                               wait=int(8*sens_factor), pre_max=int(3*sens_factor), 
+                                               post_max=int(3*sens_factor), pre_avg=int(5*sens_factor), 
+                                               post_avg=int(5*sens_factor), delta=0.08*sens_factor)
+            
+            peaks = filter_peaks(peaks)
+            
+            # 4. Pitch Tracking Estable (Spectral Centroid)
+            # YIN es errático con acordes (audio polifónico). Spectral Centroid da un "color" tonal estable.
+            centroids = librosa.feature.spectral_centroid(y=y, sr=self.sr)[0]
+            
             onsets_with_pitch = []
-            for peak in peaks:
-                index = magnitudes[:, peak].argmax()
-                pitch = pitches[index, peak]
-                onsets_with_pitch.append({"time": float(librosa.frames_to_time(peak, sr=self.sr)), "pitch": float(pitch)})
-            onsets_dict["default"] = onsets_with_pitch
             
-        else: # guitar or vocals
-            y_harmonic, y_percussive = librosa.effects.hpss(y)
-            onset_env = librosa.onset.onset_strength(y=y_percussive, sr=self.sr)
-            peaks = librosa.onset.onset_detect(onset_envelope=onset_env, sr=self.sr, wait=int(8*sens_factor), pre_max=int(4*sens_factor), post_max=int(4*sens_factor), pre_avg=int(10*sens_factor), post_avg=int(10*sens_factor), delta=0.05*sens_factor)
-            
-            pitches, magnitudes = librosa.piptrack(y=y_harmonic, sr=self.sr)
-            onsets_with_pitch = []
             for peak in peaks:
-                index = magnitudes[:, peak].argmax()
-                pitch = pitches[index, peak]
-                onsets_with_pitch.append({"time": float(librosa.frames_to_time(peak, sr=self.sr)), "pitch": float(pitch)})
+                # Obtenemos el centroide en el frame del pico (asegurando límites)
+                peak_idx = min(len(centroids) - 1, max(0, peak))
+                pitch = float(centroids[peak_idx])
+                        
+                onsets_with_pitch.append({
+                    "time": float(librosa.frames_to_time(peak, sr=self.sr)), 
+                    "pitch": float(pitch)
+                })
+                
             onsets_dict["default"] = onsets_with_pitch
 
         return onsets_dict
@@ -213,7 +235,6 @@ class AudioProcessor:
         options = options or {}
         # Prioritize frontend's static BPM to keep quantization perfectly aligned with the grid
         bpm = float(options.get("bpm")) if options.get("bpm") else tempo_data.get("bpm", 120.0)
-        complexity = float(options.get("complexity", 50.0))
         
         midi_track_map = {
             "guitar": "PART GUITAR", "bass": "PART BASS", 
@@ -242,6 +263,17 @@ class AudioProcessor:
             else:
                 t_secs = onset_data
                 pitch_hz = 0.0
+                
+            # --- DYNAMIC COMPLEXITY (SLIDING WINDOW DENSITY) ---
+            window_size = 2.0 # +/- 2 seconds
+            density_count = 0
+            for other_item in flat_onsets:
+                other_t = other_item[0]["time"] if isinstance(other_item[0], dict) else other_item[0]
+                if abs(other_t - t_secs) <= window_size:
+                    density_count += 1
+                    
+            # Map density to a local complexity score (10.0 to 100.0)
+            local_complexity = min(100.0, max(10.0, (density_count / 15.0) * 100.0))
                 
             # Calculate absolute tick
             beat = (t_secs * bpm) / 60.0
@@ -289,11 +321,18 @@ class AudioProcessor:
                     
                 # --- GUITAR / BASS ADVANCED MAPPING ---
                 if pitch_hz > 0:
-                    if pitch_hz < 150: lane = 0
-                    elif pitch_hz < 300: lane = 1
-                    elif pitch_hz < 600: lane = 2
-                    elif pitch_hz < 1000: lane = 3
-                    else: lane = 4
+                    if target_instrument == "bass":
+                        if pitch_hz < 300: lane = 0
+                        elif pitch_hz < 500: lane = 1
+                        elif pitch_hz < 700: lane = 2
+                        elif pitch_hz < 900: lane = 3
+                        else: lane = 4
+                    else:
+                        if pitch_hz < 1000: lane = 0
+                        elif pitch_hz < 1800: lane = 1
+                        elif pitch_hz < 2600: lane = 2
+                        elif pitch_hz < 3500: lane = 3
+                        else: lane = 4
                 else:
                     lane = int((tick / snap_ticks * 3 + 1) % 5)
                     
@@ -302,15 +341,15 @@ class AudioProcessor:
                 reason = f"Nota de Rasgueo (Pitch: {int(pitch_hz)}Hz)" if pitch_hz > 0 else "Nota de Rasgueo Básica"
                 
                 # 1. HOPOs & Taps (Velocidad)
-                if delta_ticks_prev <= 48 and complexity >= 30:
+                if delta_ticks_prev <= 48 and local_complexity >= 30:
                     note_type = "hopo"
                     reason = "HOPO (Ligado Rápido)"
-                    if delta_ticks_prev <= 24 and complexity >= 70:
+                    if delta_ticks_prev <= 24 and local_complexity >= 70:
                         note_type = "tap"
                         reason = "Tap/Slider (Trino o Shredding)"
                 
                 # 2. Sustains (Notas Largas)
-                if delta_ticks_next >= 192 and (measure_beat < 0.25 or measure_beat % 1.0 < 0.25) and complexity >= 40:
+                if delta_ticks_next >= 192 and (measure_beat < 0.25 or measure_beat % 1.0 < 0.25) and local_complexity >= 40:
                     # Larga duración hasta la siguiente nota
                     duration = min(delta_ticks_next - 48, 192 * 2) # Máximo 2 compases
                     if duration > 0:
@@ -319,11 +358,11 @@ class AudioProcessor:
                 notes_to_add.append((lane, note_type, reason, duration))
                 
                 # 3. Acordes (Chords)
-                if (measure_beat < 0.25) and note_type == "strum" and complexity >= 50:
+                if (measure_beat < 0.25) and note_type == "strum" and local_complexity >= 50:
                     chord_lane = (lane + 1) % 5
                     notes_to_add.append((chord_lane, note_type, "Acorde Doble (Acento de compás)", duration))
                     
-                    if measure_beat == 0 and beat_index > 16 and complexity >= 80:
+                    if measure_beat == 0 and beat_index > 16 and local_complexity >= 80:
                         chord_lane_3 = (lane + 3) % 5
                         notes_to_add.append((chord_lane_3, note_type, "Acorde Triple (Power Chord explosivo)", duration))
                 

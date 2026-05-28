@@ -107,7 +107,14 @@ def process_audio_asset(self, job_id: str, project_id: str, s3_key: str, job_typ
         # Create a mock song.ogg for frontend playback (using the master track input.wav)
         song_ogg_path = os.path.join(local_output_dir, "song.ogg")
         import subprocess
-        subprocess.run(["ffmpeg", "-y", "-i", input_audio_path, "-codec:a", "libvorbis", "-qscale:a", "5", song_ogg_path], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            subprocess.run(["ffmpeg", "-y", "-i", input_audio_path, "-codec:a", "libvorbis", "-qscale:a", "5", song_ogg_path], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as ffmpeg_err:
+            logger.warn("ffmpeg not found or failed, falling back to copying input file", error=str(ffmpeg_err))
+            try:
+                shutil.copy(input_audio_path, song_ogg_path)
+            except Exception:
+                pass
         
         stems = {target_instrument: output_stem_path}
         
