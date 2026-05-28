@@ -64,45 +64,72 @@ class AudioProcessor:
             "beat_frames": beats.tolist()
         }
 
-    def detect_notes_and_onsets(self, y: np.ndarray, instrument: str = "guitar") -> List[float]:
+    def detect_notes_and_onsets(self, y: np.ndarray, instrument: str = "guitar", options: dict = None) -> Dict[str, List[Any]]:
         """
-        Detects note onsets (transients) using tailored DSP filters and peak picking for each instrument stem.
+        Detects note onsets (transients) using tailored DSP filters.
+        For drums, applies multi-band separation to isolate Kick, Snare, and Hi-Hats.
         """
-        logger.info("Detecting onsets/transients with stem-specific DSP parameters", instrument=instrument)
+        logger.info("Detecting onsets/transients with advanced DSP", instrument=instrument)
+        from scipy.signal import butter, sosfilt
         
-        if instrument == "bass":
-            # Bass: low-frequency onset detection
-            # Compute STFT and isolate frequencies under 250 Hz
-            stft = np.abs(librosa.stft(y))
-            freqs = librosa.fft_frequencies(sr=self.sr)
-            low_freqs_mask = freqs <= 250
-            if np.any(low_freqs_mask):
-                onset_env = librosa.onset.onset_strength(S=librosa.amplitude_to_db(stft[low_freqs_mask, :], ref=np.max), sr=self.sr)
-            else:
-                onset_env = librosa.onset.onset_strength(y=y, sr=self.sr)
-            # Bass notes typically have slower attack, increase post_max and wait to prevent double triggers
-            peaks = librosa.onset.onset_detect(onset_envelope=onset_env, sr=self.sr, wait=12, pre_max=6, post_max=6, pre_avg=12, post_avg=12, delta=0.04)
+        options = options or {}
+        sensitivity = float(options.get("sensitivity", 50.0))
+        # sensitivity 0 -> higher thresholds (fewer notes), 100 -> lower thresholds (more notes)
+        # map 0-100 to a scale factor for wait/pre/post/delta
+        sens_factor = 1.0 - ((sensitivity - 50.0) / 100.0) # 50 = 1.0, 100 = 0.5, 0 = 1.5
         
-        elif instrument == "drums":
-            # Drums: extremely sharp transients (Kick, Snare, Cymbals)
-            onset_env = librosa.onset.onset_strength(y=y, sr=self.sr)
-            # Use smaller wait and post_max to capture rapid successive drum fills (e.g. rolls)
-            peaks = librosa.onset.onset_detect(onset_envelope=onset_env, sr=self.sr, wait=5, pre_max=3, post_max=3, pre_avg=8, post_avg=8, delta=0.08)
+        onsets_dict = {}
+        
+        if instrument == "drums":
+            # Multi-Band Drum Transcription
+            # 1. KICK (< 150 Hz)
+            sos_kick = butter(4, 150, 'low', fs=self.sr, output='sos')
+            y_kick = sosfilt(sos_kick, y)
+            env_kick = librosa.onset.onset_strength(y=y_kick, sr=self.sr)
+            peaks_kick = librosa.onset.onset_detect(onset_envelope=env_kick, sr=self.sr, wait=int(8*sens_factor), pre_max=int(4*sens_factor), post_max=int(4*sens_factor), pre_avg=int(8*sens_factor), post_avg=int(8*sens_factor), delta=0.06*sens_factor)
+            onsets_dict["kick"] = [{"time": float(t), "pitch": 0.0} for t in librosa.frames_to_time(peaks_kick, sr=self.sr)]
             
-        elif instrument == "vocals":
-            # Vocals: syllable boundaries and vowel onset transitions
-            # Smooth energy changes with RMS and onset strength
-            onset_env = librosa.onset.onset_strength(y=y, sr=self.sr)
-            # Vocal phrasing is sparse, use larger wait to avoid overcharting lyrics
-            peaks = librosa.onset.onset_detect(onset_envelope=onset_env, sr=self.sr, wait=15, pre_max=8, post_max=8, pre_avg=15, post_avg=15, delta=0.07)
+            # 2. SNARE (200 - 1000 Hz)
+            sos_snare = butter(4, [200, 1000], 'bandpass', fs=self.sr, output='sos')
+            y_snare = sosfilt(sos_snare, y)
+            env_snare = librosa.onset.onset_strength(y=y_snare, sr=self.sr)
+            peaks_snare = librosa.onset.onset_detect(onset_envelope=env_snare, sr=self.sr, wait=int(10*sens_factor), pre_max=int(4*sens_factor), post_max=int(4*sens_factor), pre_avg=int(10*sens_factor), post_avg=int(10*sens_factor), delta=0.07*sens_factor)
+            onsets_dict["snare"] = [{"time": float(t), "pitch": 0.0} for t in librosa.frames_to_time(peaks_snare, sr=self.sr)]
             
-        else: # guitar or fallback
-            # Guitar: standard chord strums and hopo transitions
-            onset_env = librosa.onset.onset_strength(y=y, sr=self.sr)
-            peaks = librosa.onset.onset_detect(onset_envelope=onset_env, sr=self.sr, wait=8, pre_max=4, post_max=4, pre_avg=10, post_avg=10, delta=0.06)
+            # 3. HI-HAT / CYMBALS (> 5000 Hz)
+            sos_hh = butter(4, 5000, 'high', fs=self.sr, output='sos')
+            y_hh = sosfilt(sos_hh, y)
+            env_hh = librosa.onset.onset_strength(y=y_hh, sr=self.sr)
+            peaks_hh = librosa.onset.onset_detect(onset_envelope=env_hh, sr=self.sr, wait=int(4*sens_factor), pre_max=int(2*sens_factor), post_max=int(2*sens_factor), pre_avg=int(6*sens_factor), post_avg=int(6*sens_factor), delta=0.08*sens_factor)
+            onsets_dict["hihat"] = [{"time": float(t), "pitch": 0.0} for t in librosa.frames_to_time(peaks_hh, sr=self.sr)]
+            
+        elif instrument == "bass":
+            y_harmonic, y_percussive = librosa.effects.hpss(y, margin=(1.0, 5.0))
+            onset_env = librosa.onset.onset_strength(y=y_percussive, sr=self.sr)
+            peaks = librosa.onset.onset_detect(onset_envelope=onset_env, sr=self.sr, wait=int(12*sens_factor), pre_max=int(6*sens_factor), post_max=int(6*sens_factor), pre_avg=int(12*sens_factor), post_avg=int(12*sens_factor), delta=0.04*sens_factor)
+            
+            pitches, magnitudes = librosa.piptrack(y=y_harmonic, sr=self.sr)
+            onsets_with_pitch = []
+            for peak in peaks:
+                index = magnitudes[:, peak].argmax()
+                pitch = pitches[index, peak]
+                onsets_with_pitch.append({"time": float(librosa.frames_to_time(peak, sr=self.sr)), "pitch": float(pitch)})
+            onsets_dict["default"] = onsets_with_pitch
+            
+        else: # guitar or vocals
+            y_harmonic, y_percussive = librosa.effects.hpss(y)
+            onset_env = librosa.onset.onset_strength(y=y_percussive, sr=self.sr)
+            peaks = librosa.onset.onset_detect(onset_envelope=onset_env, sr=self.sr, wait=int(8*sens_factor), pre_max=int(4*sens_factor), post_max=int(4*sens_factor), pre_avg=int(10*sens_factor), post_avg=int(10*sens_factor), delta=0.05*sens_factor)
+            
+            pitches, magnitudes = librosa.piptrack(y=y_harmonic, sr=self.sr)
+            onsets_with_pitch = []
+            for peak in peaks:
+                index = magnitudes[:, peak].argmax()
+                pitch = pitches[index, peak]
+                onsets_with_pitch.append({"time": float(librosa.frames_to_time(peak, sr=self.sr)), "pitch": float(pitch)})
+            onsets_dict["default"] = onsets_with_pitch
 
-        onset_times = librosa.frames_to_time(peaks, sr=self.sr)
-        return onset_times.tolist()
+        return onsets_dict
 
     def quantize_time(self, time_secs: float, bpm: float, snap_fraction: float = 0.0625, ppq: int = 480) -> float:
         """
@@ -129,61 +156,46 @@ class AudioProcessor:
         quantized_secs = (quantized_beats * 60.0) / bpm
         return float(quantized_secs)
 
-    def generate_midi_chart(self, tempo_data: Dict[str, Any], track_onsets: Dict[str, List[float]], output_path: str, snap_fraction: float = 0.0625):
+    def generate_midi_chart(self, tempo_data: Dict[str, Any], track_onsets: Dict[str, Dict[str, List[Any]]], output_path: str, snap_fraction: float = 0.0625, options: dict = None):
         """
-        Genera un archivo MIDI multipista compatible con Clone Hero y Rock Band.
-        Aplica cuantización a la cuadrícula y filtrado heurístico para evitar overcharting.
+        Genera un archivo MIDI multipista. Mapea categorías de batería a sus verdaderos MIDI pitches.
         """
-        logger.info("Generating quantized MIDI chart", output_path=output_path, snap_fraction=snap_fraction)
-        
-        bpm = tempo_data["bpm"]
-        # Crear objeto PrettyMIDI
+        logger.info("Generating quantized MIDI chart with DSP mappings", output_path=output_path)
+        options = options or {}
+        bpm = float(options.get("bpm")) if options.get("bpm") else tempo_data["bpm"]
         pm = pretty_midi.PrettyMIDI(initial_tempo=bpm)
         
-        for track_name, onsets in track_onsets.items():
-            if track_name not in NOTE_MAPPINGS:
-                continue
+        for track_name, onset_cats in track_onsets.items():
+            if track_name not in NOTE_MAPPINGS: continue
                 
-            # Crear instrumento MIDI para la pista
             instrument = pretty_midi.Instrument(program=0, name=track_name)
-            mappings = NOTE_MAPPINGS[track_name]
+            mappings = NOTE_MAPPINGS[track_name].get("EXPERT", {})
             
-            for difficulty, notes in mappings.items():
-                logger.info("Mapping quantized difficulty for track", track=track_name, difficulty=difficulty)
-                
-                # Coeficiente de reducción para evitar overcharting y simplificar ritmo
-                reduction_factors = {
-                    "EXPERT": 1.0,
-                    "HARD": 0.7,
-                    "MEDIUM": 0.4,
-                    "EASY": 0.2
+            # Map DSP categories to MIDI pitches
+            category_to_pitch = {}
+            if track_name == "PART DRUMS":
+                category_to_pitch = {
+                    "kick": mappings.get("KICK", 96),
+                    "snare": mappings.get("SNARE", 97),
+                    "hihat": mappings.get("HIHAT", 98),
+                    "default": mappings.get("CYMBAL", 100)
                 }
+            else:
+                category_to_pitch = {"default": mappings.get("G", 96)}
                 
-                factor = reduction_factors.get(difficulty, 1.0)
-                
-                # Filtrar onsets de acuerdo a la dificultad
-                filtered_onsets = [t for i, t in enumerate(onsets) if (i % int(1/factor) == 0) if factor < 1.0] if factor < 1.0 else onsets
-                
-                available_colors = list(notes.keys())
-                
-                for t_start_raw in filtered_onsets:
-                    # Cuantizar el inicio de la nota a la rejilla rítmica
+            for cat, onsets in onset_cats.items():
+                pitch = category_to_pitch.get(cat, mappings.get("G", 96))
+                for onset in onsets:
+                    t_start_raw = onset["time"] if isinstance(onset, dict) else onset
                     t_start = self.quantize_time(t_start_raw, bpm, snap_fraction)
-                    
-                    # Asignar color cíclico para simular jugabilidad musical
-                    color_idx = int(t_start * 10) % len(available_colors)
-                    color = available_colors[color_idx]
-                    pitch = notes[color]
-                    
-                    # Duración estándar corta para las notas de tap/strum (0.12 segundos)
                     t_end = t_start + 0.12
                     
-                    note = pretty_midi.Note(
-                        velocity=100,
-                        pitch=pitch,
-                        start=t_start,
-                        end=t_end
-                    )
+                    # For non-drums, randomly shift color just for visual variety in MIDI
+                    if track_name != "PART DRUMS":
+                        colors = list(mappings.values())
+                        pitch = colors[int(t_start * 10) % len(colors)]
+                        
+                    note = pretty_midi.Note(velocity=100, pitch=pitch, start=t_start, end=t_end)
                     instrument.notes.append(note)
                     
             pm.instruments.append(instrument)
@@ -192,8 +204,153 @@ class AudioProcessor:
         pm.write(output_path)
         logger.info("MIDI chart successfully created and quantized", output_path=output_path)
 
+    def generate_frontend_notes(self, tempo_data: Dict[str, Any], track_onsets: Dict[str, Dict[str, List[Any]]], target_instrument: str, ticks_per_beat: int = 192, options: dict = None) -> List[Dict[str, Any]]:
+        """
+        Generates a JSON-serializable list of AI notes for the frontend using advanced rhythmic heuristics and Multi-Band DSP.
+        Supports Chords, Sustains, HOPOs, Taps, Open Notes, and complete Drum kit mapping.
+        """
+        logger.info("Generating advanced AI JSON notes payload with Multi-Band DSP", instrument=target_instrument)
+        options = options or {}
+        # Prioritize frontend's static BPM to keep quantization perfectly aligned with the grid
+        bpm = float(options.get("bpm")) if options.get("bpm") else tempo_data.get("bpm", 120.0)
+        complexity = float(options.get("complexity", 50.0))
+        
+        midi_track_map = {
+            "guitar": "PART GUITAR", "bass": "PART BASS", 
+            "drums": "PART DRUMS", "vocals": "PART VOCALS"
+        }
+        track_name = midi_track_map.get(target_instrument, "PART GUITAR")
+        onset_cats = track_onsets.get(track_name, {"default": []})
+        
+        # Flatten and sort all onsets to iterate chronologically
+        flat_onsets = []
+        for cat, onsets in onset_cats.items():
+            for onset in onsets:
+                flat_onsets.append((onset, cat))
+        
+        flat_onsets.sort(key=lambda x: x[0]["time"] if isinstance(x[0], dict) else x[0])
+        
+        frontend_notes = []
+        last_tick = -9999
+        
+        for i, onset_item in enumerate(flat_onsets):
+            cat = onset_item[1]
+            onset_data = onset_item[0]
+            if isinstance(onset_data, dict):
+                t_secs = onset_data["time"]
+                pitch_hz = onset_data.get("pitch", 0.0)
+            else:
+                t_secs = onset_data
+                pitch_hz = 0.0
+                
+            # Calculate absolute tick
+            beat = (t_secs * bpm) / 60.0
+            raw_tick = int(round(beat * ticks_per_beat))
+            
+            # Snap to 1/16th notes (48 ticks at 192 ticks per beat)
+            snap_ticks = 48
+            tick = int(round(raw_tick / snap_ticks)) * snap_ticks
+            
+            # Calculate deltas to determine note speed/density
+            delta_ticks_prev = tick - last_tick if last_tick != -9999 else 9999
+            
+            
+            next_t_secs = flat_onsets[i+1][0] if i < len(flat_onsets) - 1 else flat_onsets[-1][0]
+            if isinstance(next_t_secs, dict):
+                next_t_secs = next_t_secs["time"]
+                
+            next_raw_tick = int(round(((next_t_secs * bpm) / 60.0) * ticks_per_beat))
+            delta_ticks_next = (int(round(next_raw_tick / snap_ticks)) * snap_ticks) - tick if i < len(flat_onsets) - 1 else 9999
+            
+            beat_index = tick / ticks_per_beat
+            measure_beat = beat_index % 4.0 # 0.0 to 3.99 in 4/4 time
+            
+            notes_to_add = []
+            confidence = 0.85
+            
+            if target_instrument == "drums":
+                # --- DRUMS TRUE DSP MAPPING ---
+                if cat == "kick":
+                    notes_to_add.append((0, "kick_pedal", "Bombo (Detección DSP Baja Frecuencia)", 0))
+                elif cat == "snare":
+                    notes_to_add.append((1, "strum", "Caja/Tarola (Detección DSP Frecuencia Media)", 0))
+                elif cat == "hihat":
+                    notes_to_add.append((2, "strum", "Hi-Hat/Platillo (Detección DSP Alta Frecuencia)", 0))
+                else:
+                    # Fallback for crashes/toms based on density
+                    if delta_ticks_prev <= 48 and delta_ticks_next > 96:
+                        notes_to_add.append((4, "strum", "Crash Cymbal (Heurística de Remate)", 0))
+                    else:
+                        notes_to_add.append((3, "strum", "Tom Medio (Fallback DSP)", 0))
+            else:
+                # Skip exact duplicates on same tick for guitar to avoid overlapping
+                if delta_ticks_prev == 0:
+                    continue
+                    
+                # --- GUITAR / BASS ADVANCED MAPPING ---
+                if pitch_hz > 0:
+                    if pitch_hz < 150: lane = 0
+                    elif pitch_hz < 300: lane = 1
+                    elif pitch_hz < 600: lane = 2
+                    elif pitch_hz < 1000: lane = 3
+                    else: lane = 4
+                else:
+                    lane = int((tick / snap_ticks * 3 + 1) % 5)
+                    
+                note_type = "strum"
+                duration = 0
+                reason = f"Nota de Rasgueo (Pitch: {int(pitch_hz)}Hz)" if pitch_hz > 0 else "Nota de Rasgueo Básica"
+                
+                # 1. HOPOs & Taps (Velocidad)
+                if delta_ticks_prev <= 48 and complexity >= 30:
+                    note_type = "hopo"
+                    reason = "HOPO (Ligado Rápido)"
+                    if delta_ticks_prev <= 24 and complexity >= 70:
+                        note_type = "tap"
+                        reason = "Tap/Slider (Trino o Shredding)"
+                
+                # 2. Sustains (Notas Largas)
+                if delta_ticks_next >= 192 and (measure_beat < 0.25 or measure_beat % 1.0 < 0.25) and complexity >= 40:
+                    # Larga duración hasta la siguiente nota
+                    duration = min(delta_ticks_next - 48, 192 * 2) # Máximo 2 compases
+                    if duration > 0:
+                        reason = "Sustain (Vibrato o nota final)"
+                
+                notes_to_add.append((lane, note_type, reason, duration))
+                
+                # 3. Acordes (Chords)
+                if (measure_beat < 0.25) and note_type == "strum" and complexity >= 50:
+                    chord_lane = (lane + 1) % 5
+                    notes_to_add.append((chord_lane, note_type, "Acorde Doble (Acento de compás)", duration))
+                    
+                    if measure_beat == 0 and beat_index > 16 and complexity >= 80:
+                        chord_lane_3 = (lane + 3) % 5
+                        notes_to_add.append((chord_lane_3, note_type, "Acorde Triple (Power Chord explosivo)", duration))
+                
+                # 4. Notas Abiertas (Open Notes - Metalcore)
+                if target_instrument == "guitar" and delta_ticks_prev <= 96 and delta_ticks_next <= 96 and measure_beat % 0.5 < 0.1:
+                    if len(notes_to_add) > 0 and note_type == "strum":
+                        notes_to_add[0] = (7, "open", "Open Note (Palm Mute de Metalcore)", notes_to_add[0][3])
+            
+            for (l, n_type, r, d) in notes_to_add:
+                # Deduplicate exact lane/tick
+                if not any(n["tick"] == tick and n["lane"] == l for n in frontend_notes):
+                    frontend_notes.append({
+                        "id": f"ai-gen-{int(beat)}-{tick}-{l}-{n_type}",
+                        "tick": tick,
+                        "lane": l,
+                        "confidence": confidence,
+                        "reason": r,
+                        "duration": d,
+                        "type": n_type
+                    })
+            last_tick = tick
+                
+        logger.info("Generated advanced notes successfully", count=len(frontend_notes))
+        return frontend_notes
 
-    def separate_stems_mock(self, file_path: str, output_dir: str) -> Dict[str, str]:
+
+    def separate_stems_mock(self, file_path: str, output_dir: str, target_instrument: str = None) -> Dict[str, str]:
         """
         Extracts vocal, drums, bass, and other components.
         If meta-demucs is installed in the local path, it dynamically runs neural separation.
@@ -215,109 +372,47 @@ class AudioProcessor:
         demucs_path = shutil.which("demucs")
         if demucs_path:
             logger.info("Demucs CLI detected locally! Running real neural network Music Source Separation...", command=demucs_path)
-            try:
-                # Run Demucs CLI: model htdemucs (Hybrid Transformer)
-                # Save into output_dir and enforce simple output filenames
-                cmd = [
-                    demucs_path,
-                    "-n", "htdemucs",
-                    "-o", output_dir,
-                    "--filename", "{track}.{ext}",
-                    file_path
-                ]
-                logger.info("Executing Demucs command", cmd=" ".join(cmd))
-                subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                
-                # Demucs nests output files in: {output_dir}/htdemucs/{input_filename_without_ext}/{stem}.wav
-                filename_without_ext = os.path.splitext(os.path.basename(file_path))[0]
-                demucs_nested_dir = os.path.join(output_dir, "htdemucs", filename_without_ext)
-                
-                if os.path.exists(demucs_nested_dir):
-                    logger.info("Demucs completed successfully. Moving files to align with API expectation...")
-                    import shutil as file_shutil
-                    for stem_name in ["vocals", "drums", "bass", "other"]:
-                        src = os.path.join(demucs_nested_dir, f"{stem_name}.wav")
-                        # Map 'other' to 'guitar' for Clone Hero charts standard compatibility
-                        dest_name = "guitar" if stem_name == "other" else stem_name
-                        dest = os.path.join(output_dir, f"{dest_name}.wav")
-                        if os.path.exists(src):
-                            if os.path.exists(dest):
-                                os.remove(dest)
-                            file_shutil.move(src, dest)
-                            
-                    logger.info("Neural separation stems successfully loaded and aligned!")
-                    return stems
-            except Exception as e:
-                logger.error("Failed to run local Demucs command, falling back to high-fidelity FFT", error=str(e))
+            # Run Demucs CLI: model htdemucs (Hybrid Transformer)
+            # Save into output_dir and enforce simple output filenames
+            cmd = [
+                demucs_path,
+                "-n", "htdemucs",
+                "-o", output_dir,
+                file_path
+            ]
+            logger.info("Executing Demucs command", cmd=" ".join(cmd))
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                raise Exception(f"Demucs process failed with exit code {result.returncode}:\n{result.stderr[-500:]}")
+            
+            # Demucs nests output files in: {output_dir}/htdemucs/{input_filename_without_ext}/{stem}.wav
+            filename_without_ext = os.path.splitext(os.path.basename(file_path))[0]
+            demucs_nested_dir = os.path.join(output_dir, "htdemucs", filename_without_ext)
+            
+            if os.path.exists(demucs_nested_dir):
+                logger.info("Demucs completed successfully. Moving files to align with API expectation...")
+                import shutil as file_shutil
+                for stem_name in ["vocals", "drums", "bass", "other"]:
+                    src = os.path.join(demucs_nested_dir, f"{stem_name}.wav")
+                    # Map 'other' to 'guitar' for Clone Hero charts standard compatibility
+                    dest_name = "guitar" if stem_name == "other" else stem_name
+                    dest = os.path.join(output_dir, f"{dest_name}.wav")
+                    if os.path.exists(src):
+                        if os.path.exists(dest):
+                            os.remove(dest)
+                        file_shutil.move(src, dest)
+                        
+                logger.info("Neural separation stems successfully loaded and aligned!")
+            else:
+                raise Exception(f"Demucs completed but output directory {demucs_nested_dir} not found.")
+        else:
+            raise Exception("Demucs CLI not found. Neural separation is strictly required and FFT fallback has been disabled.")
 
-        logger.info("Using high-fidelity FFT brick-wall filters fallback", file_path=file_path)
-        y, sr = self.load_audio(file_path)
-        n = len(y)
-        
-        import soundfile as sf
-        
-        # 1. BASS STEM: Low-pass brick-wall filter (Keep only < 180 Hz)
-        logger.info("Generating high-fidelity Bass stem (< 180Hz)")
-        fft_bass = np.fft.rfft(y)
-        freqs = np.fft.rfftfreq(n, d=1.0/sr)
-        fft_bass[freqs > 180] = 0.0  # Cut off everything above 180Hz (vocals, guitar, cymbals)
-        y_bass = np.fft.irfft(fft_bass, n=n)
-        # Normalize
-        max_bass = np.max(np.abs(y_bass))
-        if max_bass > 0:
-            y_bass = (y_bass / max_bass) * 0.75
-        sf.write(stems["bass"], y_bass, sr)
-        
-        # 2. VOCALS STEM: Band-pass brick-wall filter (Keep 250 Hz - 3000 Hz)
-        logger.info("Generating high-fidelity Vocals stem (250Hz - 3000Hz)")
-        fft_vocals = np.fft.rfft(y)
-        fft_vocals[freqs < 250] = 0.0   # Cut off bass & kick drum rumble
-        fft_vocals[freqs > 3000] = 0.0  # Cut off extreme cymbals & high guitar frequencies
-        y_vocals = np.fft.irfft(fft_vocals, n=n)
-        # Normalize
-        max_vocals = np.max(np.abs(y_vocals))
-        if max_vocals > 0:
-            y_vocals = (y_vocals / max_vocals) * 0.8
-        sf.write(stems["vocals"], y_vocals, sr)
-        
-        # 3. DRUMS STEM: Band-suppression split (Keep < 120 Hz and > 4500 Hz, suppress vocals/guitars in mid range)
-        logger.info("Generating high-fidelity Drums stem (Kick + Cymbals/Snare snap)")
-        fft_drums = np.fft.rfft(y)
-        # Zero out the vocal/guitar midrange (120 Hz to 4500 Hz)
-        fft_drums[(freqs >= 120) & (freqs <= 4500)] = 0.0
-        y_drums = np.fft.irfft(fft_drums, n=n)
-        # Normalize
-        max_drums = np.max(np.abs(y_drums))
-        if max_drums > 0:
-            y_drums = (y_drums / max_drums) * 0.85
-        sf.write(stems["drums"], y_drums, sr)
-        
-        # 4. GUITAR STEM: Mid-high band-pass with a notch at vocal fundamental frequencies
-        logger.info("Generating high-fidelity Guitar stem (180 Hz - 7000 Hz, vocal notch)")
-        fft_guitar = np.fft.rfft(y)
-        fft_guitar[freqs < 180] = 0.0   # Remove low bass rumble
-        fft_guitar[freqs > 7000] = 0.0  # Remove high cymbal sizzle
-        # Suppress typical vocal harmonics range (800 Hz - 1800 Hz) to keep the guitar distinct
-        fft_guitar[(freqs >= 800) & (freqs <= 1800)] *= 0.15
-        y_guitar = np.fft.irfft(fft_guitar, n=n)
-        # Normalize
-        max_guitar = np.max(np.abs(y_guitar))
-        if max_guitar > 0:
-            y_guitar = (y_guitar / max_guitar) * 0.78
-        sf.write(stems["guitar"], y_guitar, sr)
-        
         # Generate song.ogg for Clone Hero folder
         song_ogg_path = os.path.join(output_dir, "song.ogg")
         if not os.path.exists(song_ogg_path):
             logger.info("Converting master track to song.ogg using FFmpeg")
-            import subprocess
-            try:
-                cmd = ["ffmpeg", "-y", "-i", file_path, "-codec:a", "libvorbis", "-qscale:a", "5", song_ogg_path]
-                subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            except Exception as e:
-                logger.error("Failed to convert to song.ogg via FFmpeg, copying source as fallback", error=str(e))
-                import shutil as file_shutil
-                file_shutil.copy(file_path, song_ogg_path)
-
-        logger.info("High-fidelity FFT stem separation completed successfully")
+            cmd = ["ffmpeg", "-y", "-i", file_path, "-codec:a", "libvorbis", "-qscale:a", "5", song_ogg_path]
+            subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                
         return stems

@@ -2,28 +2,39 @@ import os
 import time
 import asyncio
 from uuid import UUID
+from celery import Task
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from sqlalchemy.pool import NullPool
+from app.core.config import settings
 from app.worker.celery_app import celery_app
-from app.core.database import AsyncSessionLocal
 from app.modules.audio_processor.models import ProcessingJob, AudioAsset
+from app.modules.projects.models import Project, InstrumentTrack
+from app.modules.users.models import User
 from app.modules.audio_processor.processor import AudioProcessor
 import structlog
 
 logger = structlog.get_logger()
 
-async def update_job_status(job_id: str, status: str, error_details: str | None = None):
-    """Updates the status of a ProcessingJob asynchronously."""
-    async with AsyncSessionLocal() as db:
+# Use NullPool for Celery to avoid asyncpg 'attached to different loop' errors across multiple asyncio.run() calls
+celery_engine = create_async_engine(settings.DATABASE_URL, poolclass=NullPool)
+CelerySessionLocal = async_sessionmaker(bind=celery_engine, class_=AsyncSession, expire_on_commit=False)
+
+async def update_job_status(job_id: str, status: str, error_details: str | None = None, result_data: dict | None = None):
+    async with CelerySessionLocal() as db:
         job = await db.get(ProcessingJob, UUID(job_id))
         if job:
             job.status = status
             if error_details:
                 job.error_details = error_details
+            if result_data:
+                job.result_data = result_data
             await db.commit()
             logger.info("Updated job status in DB", job_id=job_id, status=status)
 
 async def save_midi_asset(project_id: str, s3_key: str):
-    """Saves the generated MIDI file metadata asynchronously."""
-    async with AsyncSessionLocal() as db:
+    if not project_id or project_id == "None":
+        return
+    async with CelerySessionLocal() as db:
         asset = AudioAsset(
             project_id=UUID(project_id),
             s3_key=s3_key,
@@ -35,8 +46,9 @@ async def save_midi_asset(project_id: str, s3_key: str):
         logger.info("Saved MIDI asset metadata in DB", project_id=project_id, s3_key=s3_key)
 
 @celery_app.task(bind=True, name="process_audio_asset")
-def process_audio_asset(self, job_id: str, project_id: str, s3_key: str, job_type: str):
-    logger.info("Starting audio processing task", job_id=job_id, project_id=project_id, job_type=job_type)
+def process_audio_asset(self, job_id: str, project_id: str, s3_key: str, job_type: str, options: dict = None):
+    options = options or {}
+    logger.info("Starting audio processing task", job_id=job_id, project_id=project_id, job_type=job_type, options=options)
     
     # Set to processing in database
     asyncio.run(update_job_status(job_id, "processing"))
@@ -80,11 +92,27 @@ def process_audio_asset(self, job_id: str, project_id: str, s3_key: str, job_typ
         y_master, sr_master = processor.load_audio(input_audio_path)
         tempo_data = processor.analyze_tempo(y_master)
         
-        # Separate Stems
-        stems = processor.separate_stems_mock(input_audio_path, local_output_dir)
+        # Check if mandatory stem.wav exists
+        stem_audio_path = os.path.join(local_input_dir, "stem.wav")
+        if not os.path.exists(stem_audio_path):
+            logger.error("Mandatory isolated stem file not found. Aborting.")
+            raise FileNotFoundError("El usuario no subió el stem individual obligatorio (stem.wav).")
+            
+        logger.info("Using provided audio directly as isolated stem", instrument=target_instrument)
+        import shutil
+        # Copy to target instrument name to satisfy downstream logic
+        output_stem_path = os.path.join(local_output_dir, f"{target_instrument}.wav")
+        shutil.copy(stem_audio_path, output_stem_path)
+        
+        # Create a mock song.ogg for frontend playback (using the master track input.wav)
+        song_ogg_path = os.path.join(local_output_dir, "song.ogg")
+        import subprocess
+        subprocess.run(["ffmpeg", "-y", "-i", input_audio_path, "-codec:a", "libvorbis", "-qscale:a", "5", song_ogg_path], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        
+        stems = {target_instrument: output_stem_path}
         
         # Load the specific stem file for the target instrument
-        stem_path = stems.get(target_instrument, input_audio_path)
+        stem_path = stems.get(target_instrument, stem_audio_path)
         if os.path.exists(stem_path):
             logger.info("Loading isolated stem for precision onset detection", instrument=target_instrument, path=stem_path)
             y_stem, sr_stem = processor.load_audio(stem_path)
@@ -93,7 +121,7 @@ def process_audio_asset(self, job_id: str, project_id: str, s3_key: str, job_typ
             y_stem, sr_stem = y_master, sr_master
             
         # Detect precise onsets for the target instrument on its isolated stem
-        onsets = processor.detect_notes_and_onsets(y_stem, instrument=target_instrument)
+        onsets = processor.detect_notes_and_onsets(y_stem, instrument=target_instrument, options=options)
         
         # Standardize track name for Clone Hero / Rock Band MIDI
         midi_track_map = {
@@ -111,14 +139,17 @@ def process_audio_asset(self, job_id: str, project_id: str, s3_key: str, job_typ
         # 3. Generate MIDI Chart
         midi_filename = f"chart_{job_id}.mid"
         local_midi_path = os.path.join(local_output_dir, midi_filename)
-        processor.generate_midi_chart(tempo_data, track_onsets, local_midi_path)
+        processor.generate_midi_chart(tempo_data, track_onsets, local_midi_path, options=options)
         
-        # 4. Upload results (mock/save path as S3 key)
+        # 4. Generate JSON notes for frontend
+        frontend_notes = processor.generate_frontend_notes(tempo_data, track_onsets, target_instrument, options=options)
+        
+        # 5. Upload results (mock/save path as S3 key)
         midi_s3_key = f"projects/{project_id}/charts/{midi_filename}"
         
         # Save to DB asynchronously
         asyncio.run(save_midi_asset(project_id, midi_s3_key))
-        asyncio.run(update_job_status(job_id, "completed"))
+        asyncio.run(update_job_status(job_id, "completed", result_data={"notes": frontend_notes}))
         
         logger.info("Audio processing task completed successfully", job_id=job_id)
         return {

@@ -23,6 +23,21 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+from fastapi.responses import JSONResponse
+from fastapi.requests import Request
+import traceback
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    with open("error.log", "a") as f:
+        f.write(f"Exception on {request.url.path}:\n")
+        traceback.print_exc(file=f)
+    return JSONResponse(
+        status_code=500,
+        content={"message": str(exc)},
+    )
+
+
 # CORS configuration
 app.add_middleware(
     CORSMiddleware,

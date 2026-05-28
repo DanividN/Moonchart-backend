@@ -1,1 +1,54 @@
 .agents/
+venv/
+env/
+.env
+
+# Archivos de logs y temporales
+*.log
+*.bak
+dummy.txt
+tmp/
+temp/
+
+# Archivos que se crean dinámicamente con el uso de la app (Subidas de usuarios)
+storage/input/
+storage/output/
+!storage/input/.gitkeep
+!storage/output/.gitkeep
+
+# Archivos que se descargan o generan con la instalación automáticamente (Python)
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Entornos Virtuales adicionales
+.venv/
+env.bak/
+venv.bak/
+
+# Configuraciones de IDE (VSCode, PyCharm)
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Docker
+.docker/
+docker-compose.override.yml
